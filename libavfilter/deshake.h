@@ -30,6 +30,7 @@
 #include "libavutil/opencl.h"
 #endif
 
+//#define OCL_FINDMOTION
 
 enum SearchMethod {
     EXHAUSTIVE,        ///< Search all possible positions
@@ -67,6 +68,16 @@ typedef struct {
     size_t cl_inbuf_size;
     cl_mem cl_outbuf;
     size_t cl_outbuf_size;
+#ifdef OCL_FINDMOTION	
+    cl_kernel kernel_findmotion;
+    cl_mem cl_refbuf;
+    size_t cl_refbuf_size;
+    cl_mem cl_tempbuf;
+    cl_mem cl_mvbuf;
+    cl_mem cl_mvcountbuf;
+    cl_mem cl_blockanglesbuf;
+    cl_mem cl_blockPosTable;
+#endif	
 } DeshakeOpenclContext;
 
 #endif
@@ -77,6 +88,9 @@ typedef struct {
     const AVClass *class;
     int counts[2*MAX_R+1][2*MAX_R+1]; /// < Scratch buffer for motion search
     double *angles;            ///< Scratch buffer for block angles
+#ifdef OCL_FINDMOTION	
+    float *angles_ocl;            ///< Scratch buffer for block angles
+#endif	
     unsigned angles_size;
     AVFrame *ref;              ///< Previous frame
     int rx;                    ///< Maximum horizontal shift
@@ -98,10 +112,18 @@ typedef struct {
     int opencl;
 #if CONFIG_OPENCL
     DeshakeOpenclContext opencl_ctx;
+#ifdef OCL_FINDMOTION	
+	//IntMotionVector* mvgpu;
+	int *opencl_offsetTable;
+#endif	
 #endif
     int (* transform)(AVFilterContext *ctx, int width, int height, int cw, int ch,
                       const float *matrix_y, const float *matrix_uv, enum InterpolateMethod interpolate,
                       enum FillMethod fill, AVFrame *in, AVFrame *out);
+					  
+    int (* find_motion)(AVFilterContext *ctx, uint8_t *src1, uint8_t *src2,
+                        int width, int height, int stride, Transform *t);
+					  
 } DeshakeContext;
 
 #endif /* AVFILTER_DESHAKE_H */

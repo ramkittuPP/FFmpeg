@@ -174,6 +174,13 @@ int av_opencl_register_kernel_code(const char *kernel_code);
 int av_opencl_init(AVOpenCLExternalEnv *ext_opencl_env);
 
 /**
+* get OpenCL device id
+*
+* @return a device id object
+*/
+cl_device_id av_opencl_get_device_id(void);
+
+/**
  * compile specific OpenCL kernel source
  *
  * @param program_name  pointer to a program name used for identification

@@ -33,6 +33,265 @@
 #define PLANE_NUM 3
 #define ROUND_TO_16(a) (((((a) - 1)/16)+1)*16)
 
+#ifdef OCL_FINDMOTION	
+
+static int cmp_ocl(const float *a, const float *b)
+{
+    return *a < *b ? -1 : ( *a > *b ? 1 : 0 );
+}
+
+/**
+ * Cleaned mean (cuts off 20% of values to remove outliers and then averages)
+ */
+static float clean_mean_ocl(float *values, int count)
+{
+    float mean = 0;
+    int cut = count / 5;
+    int x;
+
+    qsort(values, count, sizeof(float), (void*)cmp_ocl);
+
+    for (x = cut; x < count - cut; x++) {
+        mean += values[x];
+    }
+
+    return mean / (count - cut * 2);
+}
+
+/**
+ * Find the contrast of a given block. When searching for global motion we
+ * really only care about the high contrast blocks, so using this method we
+ * can actually skip blocks we don't care much about.
+ */
+static int block_contrast_gpu(uint8_t *src, int x, int y, int stride, int blocksize)
+{
+    int highest = 0;
+    int lowest = 255;
+    int i, j, pos;
+
+    for (i = 0; i <= blocksize * 2; i++) {
+        // We use a width of 16 here to match the sad function
+        for (j = 0; j <= 15; j++) {
+            pos = (y - i) * stride + (x - j);
+            if (src[pos] < lowest)
+                lowest = src[pos];
+            else if (src[pos] > highest) {
+                highest = src[pos];
+            }
+        }
+    }
+
+    return highest - lowest;
+}
+
+/**
+* Count valid blocks for which motion estimation gets carried out
+*/
+static int valid_blocks(DeshakeContext *deshake, uint8_t *src, int stride, int width, int height, int *inOffsetTable)
+{
+	int x, y;
+	int contrast, blocks_count = 0;
+
+	for (y = deshake->ry; y < height - deshake->ry - (deshake->blocksize * 2); y += deshake->blocksize * 2)
+	{
+		for (x = deshake->rx; x < width - deshake->rx - 16; x += 16)
+		{
+			contrast = block_contrast_gpu(src, x, y, stride, deshake->blocksize);
+			if (contrast > deshake->contrast)
+			{
+				inOffsetTable[blocks_count] = (x << 16) | y;
+				blocks_count++;
+			}
+		}
+	}
+
+	return blocks_count;
+}
+
+/**
+* Top level opencl function
+*/
+int ff_opencl_findmotion(AVFilterContext *ctx, uint8_t *src1, uint8_t *src2,
+                        int width, int height, int stride, Transform *t)
+{
+    int ret = 0;
+    cl_int status;
+    DeshakeContext *deshake = ctx->priv;
+    FFOpenclParam param_fm = {0};
+    param_fm.ctx = ctx;
+    param_fm.kernel = deshake->opencl_ctx.kernel_findmotion;
+    size_t cl_mv_outsize, cl_blkangles_outsize;
+    size_t cl_mv_countsize, cl_blkoffset_tablesize;
+
+    size_t local_worksize[2] = {16, 16};
+	int  globalDim[2] = {(width - 2 * deshake->rx - 16)/16, (height - 2 * deshake->ry - 1 ) / (2 * deshake->blocksize)};
+    size_t global_worksize_fm[2] = { globalDim[0] * local_worksize[0], globalDim[1] * local_worksize[1] };
+
+    cl_blkoffset_tablesize = (width * height) * sizeof(int) / 256;
+
+    if(!deshake->opencl_offsetTable)
+	{
+		deshake->opencl_offsetTable = (int*)malloc(cl_blkoffset_tablesize);
+	}
+	
+	int validBlks = 0;
+	//memset((void *)deshake->opencl_offsetTable, 0, cl_blkoffset_tablesize);
+	validBlks = valid_blocks(deshake, src2, stride, width, height, deshake->opencl_offsetTable);
+	
+	cl_mv_outsize = validBlks * sizeof(IntMotionVector);
+	cl_mv_countsize = (2 * MAX_R + 1) * (2 * MAX_R + 1) * sizeof(int);
+	cl_blkangles_outsize = validBlks * sizeof(float); 
+
+    if(src1 == src2)
+    {
+      	deshake->opencl_ctx.cl_refbuf = deshake->opencl_ctx.cl_inbuf;
+    }
+	
+    if ((!deshake->opencl_ctx.cl_refbuf) || (!deshake->opencl_ctx.cl_mvbuf) ||
+		(!deshake->opencl_ctx.cl_mvcountbuf) || (!deshake->opencl_ctx.cl_blockanglesbuf)) {
+
+		if (!deshake->opencl_ctx.cl_tempbuf) {
+            ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_tempbuf,
+                                            deshake->opencl_ctx.cl_refbuf_size,
+											CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, NULL); //
+            if (ret < 0)
+                return ret;
+        }
+		
+        if (!deshake->opencl_ctx.cl_mvbuf) {
+            ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_mvbuf,
+                                            cl_mv_outsize,
+                                            CL_MEM_READ_WRITE, NULL);
+            if (ret < 0)
+                return ret;
+        }
+        if (!deshake->opencl_ctx.cl_mvcountbuf) {
+            ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_mvcountbuf,
+                                            cl_mv_countsize,
+											CL_MEM_READ_WRITE, NULL); //  | CL_MEM_ALLOC_HOST_PTR
+            if (ret < 0)
+                return ret;
+
+			memset((void *)&deshake->counts[0][0], 0, cl_mv_countsize);
+			av_opencl_buffer_write(deshake->opencl_ctx.cl_mvcountbuf, &deshake->counts[0][0], cl_mv_countsize);
+        }
+        if (!deshake->opencl_ctx.cl_blockanglesbuf) {
+            ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_blockanglesbuf,
+                                            cl_blkangles_outsize,
+											CL_MEM_READ_WRITE, NULL); //  | CL_MEM_ALLOC_HOST_PTR
+            if (ret < 0)
+                return ret;
+        }
+        if (!deshake->opencl_ctx.cl_blockPosTable) {
+            ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_blockPosTable,
+                                            cl_blkoffset_tablesize,
+											CL_MEM_READ_ONLY, NULL); //  | CL_MEM_ALLOC_HOST_PTR
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+	
+    ret = avpriv_opencl_set_parameter(&param_fm,
+                                  FF_OPENCL_PARAM_INFO(deshake->opencl_ctx.cl_refbuf),
+                                  FF_OPENCL_PARAM_INFO(deshake->opencl_ctx.cl_inbuf),
+                                  FF_OPENCL_PARAM_INFO(stride),
+                                  FF_OPENCL_PARAM_INFO(deshake->opencl_ctx.cl_mvbuf),
+                                  FF_OPENCL_PARAM_INFO(deshake->opencl_ctx.cl_mvcountbuf),
+                                  FF_OPENCL_PARAM_INFO(deshake->opencl_ctx.cl_blockanglesbuf),
+                                  FF_OPENCL_PARAM_INFO(deshake->opencl_ctx.cl_blockPosTable),
+                                  NULL);
+    if (ret < 0)
+        return ret;
+	
+	av_opencl_buffer_write(deshake->opencl_ctx.cl_blockPosTable, deshake->opencl_offsetTable, cl_blkoffset_tablesize);
+
+	size_t local_work[2] = {16, 16 };
+	size_t global_work[2] = { validBlks * local_work[0], local_work[1]};
+	
+    status = clEnqueueNDRangeKernel(deshake->opencl_ctx.command_queue,
+                                    deshake->opencl_ctx.kernel_findmotion, 2, NULL,
+                                    global_work, local_work, 0, NULL, NULL);
+	clFinish(deshake->opencl_ctx.command_queue);
+
+    if (status != CL_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "OpenCL run kernel error occurred: %s\n", av_opencl_errstr(status));
+        return AVERROR_EXTERNAL;
+    }
+
+	if(!deshake->angles_ocl)
+	{
+		deshake->angles_ocl = (float*)av_mallocz(cl_blkangles_outsize);
+		
+	}
+	
+    ret = av_opencl_buffer_read(&deshake->counts[0][0], deshake->opencl_ctx.cl_mvcountbuf, cl_mv_countsize);
+    ret |= av_opencl_buffer_read(deshake->angles_ocl, deshake->opencl_ctx.cl_blockanglesbuf, cl_blkangles_outsize);
+	
+    if (ret < 0)
+        return ret;
+
+	
+    int center_x = 0, center_y = 0;
+	int ii, jj, temp, pos = 0;
+#define RANGE_X 16
+#define RANGE_Y 16
+
+	for (ii = 0; ii < (2 * RANGE_Y); ii++)
+	{
+		for (jj = 0; jj < (2 * RANGE_X); jj++)
+		{
+			if (deshake->counts[ii][jj] > 0)
+			{
+				center_y += (ii - RANGE_Y) * deshake->counts[ii][jj];
+				center_x += (jj - RANGE_X) * deshake->counts[ii][jj];
+			
+				pos += deshake->counts[ii][jj];
+			}
+		}
+	}
+	
+    if (pos) {
+         center_x /= pos;
+         center_y /= pos;
+         t->angle = clean_mean_ocl(deshake->angles_ocl, pos);
+         if (t->angle < 0.001)
+              t->angle = 0;
+    } else {
+         t->angle = 0;
+    }
+
+    int x, y;
+    float p_x, p_y;
+    int count_max_value = 0;
+    // Find the most common motion vector in the frame and use it as the gmv
+    for (y = deshake->ry * 2; y >= 0; y--) {
+        for (x = 0; x < deshake->rx * 2 + 1; x++) {
+            //av_log(NULL, AV_LOG_ERROR, "%5d ", deshake->counts[x][y]);
+            if (deshake->counts[x][y] > count_max_value) {
+                t->vec.x = x - deshake->rx;
+                t->vec.y = y - deshake->ry;
+                count_max_value = deshake->counts[x][y];
+            }
+        }
+        //av_log(NULL, AV_LOG_ERROR, "\n");
+    }
+
+    p_x = (center_x - width / 2.0);
+    p_y = (center_y - height / 2.0);
+    t->vec.x += (cos(t->angle)-1)*p_x  - sin(t->angle)*p_y;
+    t->vec.y += sin(t->angle)*p_x  + (cos(t->angle)-1)*p_y;
+
+    // Clamp max shift & rotation?
+    t->vec.x = av_clipf(t->vec.x, -deshake->rx * 2, deshake->rx * 2);
+    t->vec.y = av_clipf(t->vec.y, -deshake->ry * 2, deshake->ry * 2);
+    t->angle = av_clipf(t->angle, -0.1, 0.1);
+
+	
+    return ret;
+}
+
+#endif
 int ff_opencl_transform(AVFilterContext *ctx,
                         int width, int height, int cw, int ch,
                         const float *matrix_y, const float *matrix_uv,
@@ -102,6 +361,12 @@ int ff_opencl_transform(AVFilterContext *ctx,
                                       deshake->opencl_ctx.cl_outbuf_size);
     if (ret < 0)
         return ret;
+
+#ifdef OCL_FINDMOTION	
+	deshake->opencl_ctx.cl_refbuf = deshake->opencl_ctx.cl_inbuf;
+	deshake->opencl_ctx.cl_inbuf = deshake->opencl_ctx.cl_tempbuf;
+	deshake->opencl_ctx.cl_tempbuf = deshake->opencl_ctx.cl_refbuf;
+#endif	
     return ret;
 }
 
@@ -118,11 +383,43 @@ int ff_opencl_deshake_init(AVFilterContext *ctx)
         av_log(ctx, AV_LOG_ERROR, "Unable to get OpenCL command queue in filter 'deshake'\n");
         return AVERROR(EINVAL);
     }
-    deshake->opencl_ctx.program = av_opencl_compile("avfilter_transform", NULL);
+
+	int AMD_device = 0;
+	int cb = 0;
+	cl_device_id device_id = av_opencl_get_device_id();
+	clGetDeviceInfo(device_id, CL_DEVICE_VENDOR, 0, NULL, &cb);
+    char *vendor = (char *)malloc(cb);
+	clGetDeviceInfo(device_id, CL_DEVICE_VENDOR, cb, vendor, 0);
+	if (strstr(vendor, "Advanced Micro Devices") || strstr(vendor, "AMD"))
+		AMD_device = 1;
+	free(vendor);
+	
+    char *flags = (char *)malloc(256);
+	if (AMD_device == 1)
+        sprintf(flags, "-D AMD_DEVICE=1 -D BYTES_PACK(a)=amd_pack(a) -D VECTOR_SAD(x,y,z)=amd_sad4(x,y,z) -D RANGE_X=16 -D RANGE_Y=16 -D BLOCK_SIZE=16 -D MAX_R=64 -D GPU_M_PI=3.14159265358979323846 -D CURBUF_WIDTH=48 -D CURBUF_HEIGHT=48");
+	else	
+        sprintf(flags, "-D AMD_DEVICE=0 -D BYTES_PACK(a)=dummy_pack(a) -D VECTOR_SAD(x,y,z)=dummy_sad4(x,y,z) -D RANGE_X=16 -D RANGE_Y=16 -D BLOCK_SIZE=16 -D MAX_R=64 -D GPU_M_PI=3.14159265358979323846 -D CURBUF_WIDTH=48 -D CURBUF_HEIGHT=48");
+    deshake->opencl_ctx.program = av_opencl_compile("avfilter_transform", flags);
     if (!deshake->opencl_ctx.program) {
         av_log(ctx, AV_LOG_ERROR, "OpenCL failed to compile program 'avfilter_transform'\n");
         return AVERROR(EINVAL);
     }
+    free(flags);	
+	
+#ifdef OCL_FINDMOTION
+    if (!deshake->opencl_ctx.kernel_findmotion) {
+	//	if (AMD_device == 1)
+    //        deshake->opencl_ctx.kernel_findmotion = clCreateKernel(deshake->opencl_ctx.program,
+    //                                                     "avfilter_deshake_findmotion_amd", &ret);
+	//	else
+            deshake->opencl_ctx.kernel_findmotion = clCreateKernel(deshake->opencl_ctx.program,
+                                                         "avfilter_deshake_findmotion", &ret);
+        if (ret != CL_SUCCESS) {
+            av_log(ctx, AV_LOG_ERROR, "OpenCL failed to create kernel 'avfilter_deshake_findmotion'\n");
+            return AVERROR(EINVAL);
+        }
+    }
+#endif	
     if (!deshake->opencl_ctx.kernel_luma) {
         deshake->opencl_ctx.kernel_luma = clCreateKernel(deshake->opencl_ctx.program,
                                                          "avfilter_transform_luma", &ret);
@@ -147,6 +444,9 @@ void ff_opencl_deshake_uninit(AVFilterContext *ctx)
     DeshakeContext *deshake = ctx->priv;
     av_opencl_buffer_release(&deshake->opencl_ctx.cl_inbuf);
     av_opencl_buffer_release(&deshake->opencl_ctx.cl_outbuf);
+#ifdef OCL_FINDMOTION	
+    clReleaseKernel(deshake->opencl_ctx.kernel_findmotion);
+#endif	
     clReleaseKernel(deshake->opencl_ctx.kernel_luma);
     clReleaseKernel(deshake->opencl_ctx.kernel_chroma);
     clReleaseProgram(deshake->opencl_ctx.program);
@@ -172,20 +472,23 @@ int ff_opencl_deshake_process_inout_buf(AVFilterContext *ctx, AVFrame *in, AVFra
         deshake->opencl_ctx.cl_inbuf_size  = deshake->opencl_ctx.in_plane_size[0] +
                                              deshake->opencl_ctx.in_plane_size[1] +
                                              deshake->opencl_ctx.in_plane_size[2];
+#ifdef OCL_FINDMOTION	
+		deshake->opencl_ctx.cl_refbuf_size	= deshake->opencl_ctx.cl_inbuf_size;
+#endif		
         deshake->opencl_ctx.cl_outbuf_size = deshake->opencl_ctx.out_plane_size[0] +
                                              deshake->opencl_ctx.out_plane_size[1] +
                                              deshake->opencl_ctx.out_plane_size[2];
         if (!deshake->opencl_ctx.cl_inbuf) {
             ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_inbuf,
                                             deshake->opencl_ctx.cl_inbuf_size,
-                                            CL_MEM_READ_ONLY, NULL);
+											CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, NULL); //
             if (ret < 0)
                 return ret;
         }
         if (!deshake->opencl_ctx.cl_outbuf) {
             ret = av_opencl_buffer_create(&deshake->opencl_ctx.cl_outbuf,
                                             deshake->opencl_ctx.cl_outbuf_size,
-                                            CL_MEM_READ_WRITE, NULL);
+                                            CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, NULL); //
             if (ret < 0)
                 return ret;
         }

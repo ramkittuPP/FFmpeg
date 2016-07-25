@@ -233,8 +233,9 @@ static double block_angle(int x, int y, int cx, int cy, IntMotionVector *shift)
  * move one pixel to the right and two pixels down, this would yield a
  * motion vector (1, -2).
  */
-static void find_motion(DeshakeContext *deshake, uint8_t *src1, uint8_t *src2,
-                        int width, int height, int stride, Transform *t)
+
+static int deshake_findmotion_c(AVFilterContext *ctx, uint8_t *src1, uint8_t *src2,
+                                 int width, int height, int stride, Transform *t)
 {
     int x, y;
     IntMotionVector mv = {0, 0};
@@ -245,6 +246,8 @@ static void find_motion(DeshakeContext *deshake, uint8_t *src1, uint8_t *src2,
     int center_x = 0, center_y = 0;
     double p_x, p_y;
 
+	DeshakeContext *deshake = ctx->priv;
+	
     av_fast_malloc(&deshake->angles, &deshake->angles_size, width * height / (16 * deshake->blocksize) * sizeof(*deshake->angles));
 
     // Reset counts to zero
@@ -310,6 +313,7 @@ static void find_motion(DeshakeContext *deshake, uint8_t *src1, uint8_t *src2,
     t->vec.y = av_clipf(t->vec.y, -deshake->ry * 2, deshake->ry * 2);
     t->angle = av_clipf(t->angle, -0.1, 0.1);
 
+	return 0;
     //av_log(NULL, AV_LOG_ERROR, "%d x %d\n", avg->x, avg->y);
 }
 
@@ -369,6 +373,8 @@ static av_cold int init(AVFilterContext *ctx)
         deshake->cx &= ~15;
     }
     deshake->transform = deshake_transform_c;
+    deshake->find_motion = deshake_findmotion_c;
+	
     if (!CONFIG_OPENCL && deshake->opencl) {
         av_log(ctx, AV_LOG_ERROR, "OpenCL support was not enabled in this build, cannot be selected\n");
         return AVERROR(EINVAL);
@@ -376,6 +382,9 @@ static av_cold int init(AVFilterContext *ctx)
 
     if (CONFIG_OPENCL && deshake->opencl) {
         deshake->transform = ff_opencl_transform;
+#ifdef OCL_FINDMOTION	
+		deshake->find_motion = ff_opencl_findmotion;
+#endif		
         ret = ff_opencl_deshake_init(ctx);
         if (ret < 0)
             return ret;
@@ -431,11 +440,13 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     DeshakeContext *deshake = link->dst->priv;
     AVFilterLink *outlink = link->dst->outputs[0];
     AVFrame *out;
+	uint8_t *src1, *src2;
     Transform t = {{0},0}, orig = {{0},0};
     float matrix_y[9], matrix_uv[9];
     float alpha = 2.0 / deshake->refcount;
     char tmp[256];
     int ret = 0;
+	int cWidth, cHeight;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
     const int chroma_width  = AV_CEIL_RSHIFT(link->w, desc->log2_chroma_w);
     const int chroma_height = AV_CEIL_RSHIFT(link->h, desc->log2_chroma_h);
@@ -455,10 +466,13 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
 
     if (deshake->cx < 0 || deshake->cy < 0 || deshake->cw < 0 || deshake->ch < 0) {
         // Find the most likely global motion for the current frame
-        find_motion(deshake, (deshake->ref == NULL) ? in->data[0] : deshake->ref->data[0], in->data[0], link->w, link->h, in->linesize[0], &t);
+        src1 = (deshake->ref == NULL) ? in->data[0] : deshake->ref->data[0];
+        src2 = in->data[0];
+		cWidth = link->w;
+		cHeight = link->h;
     } else {
-        uint8_t *src1 = (deshake->ref == NULL) ? in->data[0] : deshake->ref->data[0];
-        uint8_t *src2 = in->data[0];
+        src1 = (deshake->ref == NULL) ? in->data[0] : deshake->ref->data[0];
+        src2 = in->data[0];
 
         deshake->cx = FFMIN(deshake->cx, link->w);
         deshake->cy = FFMIN(deshake->cy, link->h);
@@ -472,9 +486,12 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
         src1 += deshake->cy * in->linesize[0] + deshake->cx;
         src2 += deshake->cy * in->linesize[0] + deshake->cx;
 
-        find_motion(deshake, src1, src2, deshake->cw, deshake->ch, in->linesize[0], &t);
+		cWidth = deshake->cw;
+		cHeight = deshake->ch;
+		
     }
 
+	deshake->find_motion(link->dst, src1, src2, cWidth, cHeight, in->linesize[0], &t);
 
     // Copy transform so we can output it later to compare to the smoothed value
     orig.vec.x = t.vec.x;

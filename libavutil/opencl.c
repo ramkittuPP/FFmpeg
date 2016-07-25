@@ -440,6 +440,11 @@ end:
     return ret;
 }
 
+cl_device_id av_opencl_get_device_id(void)
+{
+	return opencl_ctx.device_id;
+}
+
 cl_program av_opencl_compile(const char *program_name, const char *build_opts)
 {
     int i;
