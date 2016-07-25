@@ -2,7 +2,8 @@ include $(SUBDIR)../config.mak
 
 NAME = avcodec
 
-HEADERS = avcodec.h                                                     \
+HEADERS = amf_capi.h                                                    \
+          avcodec.h                                                     \
           avdct.h                                                       \
           avfft.h                                                       \
           d3d11va.h                                                     \
@@ -128,6 +129,7 @@ OBJS-$(CONFIG_TEXTUREDSPENC)           += texturedspenc.o
 OBJS-$(CONFIG_TPELDSP)                 += tpeldsp.o
 OBJS-$(CONFIG_VAAPI_ENCODE)            += vaapi_encode.o
 OBJS-$(CONFIG_VC1DSP)                  += vc1dsp.o
+OBJS-$(CONFIG_VCE)                     += amf_capi.o
 OBJS-$(CONFIG_VIDEODSP)                += videodsp.o
 OBJS-$(CONFIG_VP3DSP)                  += vp3dsp.o
 OBJS-$(CONFIG_VP56DSP)                 += vp56dsp.o
@@ -325,6 +327,7 @@ OBJS-$(CONFIG_H264_VDA_DECODER)        += vda_h264_dec.o
 OBJS-$(CONFIG_H264_OMX_ENCODER)        += omx.o
 OBJS-$(CONFIG_H264_QSV_DECODER)        += qsvdec_h2645.o
 OBJS-$(CONFIG_H264_QSV_ENCODER)        += qsvenc_h264.o
+OBJS-$(CONFIG_H264_VCE_ENCODER)        += vce_h264.o
 OBJS-$(CONFIG_H264_VAAPI_ENCODER)      += vaapi_encode_h264.o vaapi_encode_h26x.o
 OBJS-$(CONFIG_H264_VIDEOTOOLBOX_ENCODER) += videotoolboxenc.o
 OBJS-$(CONFIG_HAP_DECODER)             += hapdec.o hap.o

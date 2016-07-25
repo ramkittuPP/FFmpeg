@@ -75,6 +75,7 @@ void avcodec_register_all(void)
     REGISTER_HWACCEL(H264_MEDIACODEC,   h264_mediacodec);
     REGISTER_HWACCEL(H264_MMAL,         h264_mmal);
     REGISTER_HWACCEL(H264_QSV,          h264_qsv);
+    REGISTER_HWACCEL(H264_VCE,          h264_vce);
     REGISTER_HWACCEL(H264_VAAPI,        h264_vaapi);
     REGISTER_HWACCEL(H264_VDA,          h264_vda);
     REGISTER_HWACCEL(H264_VDA_OLD,      h264_vda_old);
@@ -628,6 +629,7 @@ void avcodec_register_all(void)
     REGISTER_ENCODER(H264_NVENC,        h264_nvenc);
     REGISTER_ENCODER(H264_OMX,          h264_omx);
     REGISTER_ENCODER(H264_QSV,          h264_qsv);
+    REGISTER_ENCODER(H264_VCE,          h264_vce);
     REGISTER_ENCODER(H264_VAAPI,        h264_vaapi);
     REGISTER_ENCODER(H264_VIDEOTOOLBOX, h264_videotoolbox);
 #if FF_API_NVENC_OLD_NAME
